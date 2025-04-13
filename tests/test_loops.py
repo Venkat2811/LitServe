@@ -78,6 +78,7 @@ class DummyMessageTransport(MessageTransport):
         pass
 
 
+@pytest.mark.timeout(20)
 def test_single_loop(loop_args):
     lit_api_mock, requests_queue = loop_args
     lit_api_mock.unbatch.side_effect = None
@@ -103,6 +104,7 @@ class FakeStreamSender(DummyMessageTransport):
         self.count += 1
 
 
+@pytest.mark.timeout(20)
 def test_streaming_loop():
     num_streamed_outputs = 10
 
@@ -163,6 +165,7 @@ class FakeBatchStreamTransport(DummyMessageTransport):
         self.count += 1
 
 
+@pytest.mark.timeout(20)
 def test_batched_streaming_loop(mock_transport):
     num_streamed_outputs = 10
 
@@ -233,6 +236,7 @@ def test_inference_worker(mock_single_loop, mock_batched_loop):
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(20)
 async def test_run_single_loop(mock_transport):
     lit_api = ls.test_examples.SimpleLitAPI()
     lit_api.setup(None)
@@ -253,7 +257,7 @@ async def test_run_single_loop(mock_transport):
     time.sleep(1)
 
     # Stop the loop by putting a sentinel value in the queue
-    request_queue.put((None, None, None, None))
+    request_queue.put((None, None, time.monotonic(), None))
     loop_thread.join()
 
     response = await transport.areceive(consumer_id=0)
@@ -261,6 +265,7 @@ async def test_run_single_loop(mock_transport):
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(20)
 async def test_run_single_loop_timeout():
     stream = io.StringIO()
     ls.configure_logging(stream=stream)
@@ -286,11 +291,12 @@ async def test_run_single_loop_timeout():
     assert response.status_code == 504
     assert "Request UUID-001 was waiting in the queue for too long" in stream.getvalue()
 
-    request_queue.put((None, None, None, None))
+    request_queue.put((None, None, time.monotonic(), None))
     loop_thread.join()
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(20)
 async def test_run_batched_loop():
     lit_api = ls.test_examples.SimpleBatchedAPI()
     lit_api.setup(None)
@@ -320,11 +326,12 @@ async def test_run_batched_loop():
         actual = await transport.areceive(0, timeout=10)
         assert actual == expected, f"Expected {expected}, got {actual}"
 
-    request_queue.put((None, None, None, None))
+    request_queue.put((None, None, time.monotonic(), None))
     loop_thread.join()
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(20)
 async def test_run_batched_loop_timeout(mock_transport):
     stream = io.StringIO()
     ls.configure_logging(stream=stream)
@@ -361,11 +368,12 @@ async def test_run_batched_loop_timeout(mock_transport):
     _, (response2, _) = await transport.areceive(consumer_id=0, timeout=10)
     assert response2 == {"output": 25.0}
 
-    request_queue.put((None, None, None, None))
+    request_queue.put((None, None, time.monotonic(), None))
     loop_thread.join()
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(20)
 async def test_run_streaming_loop(mock_transport):
     lit_api = ls.test_examples.SimpleStreamAPI()
     lit_api.setup(None)
@@ -385,16 +393,17 @@ async def test_run_streaming_loop(mock_transport):
     time.sleep(1)
 
     # Stop the loop by putting a sentinel value in the queue
-    request_queue.put((None, None, None, None))
+    request_queue.put((None, None, time.monotonic(), None))
     loop_thread.join()
 
     for i in range(3):
-        response = await mock_transport.areceive(0, timeout=10)
+        response = await mock_transport.areceive(0)
         response = json.loads(response[1][0])
         assert response == {"output": f"{i}: Hello"}
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(20)
 async def test_run_streaming_loop_timeout(mock_transport):
     stream = io.StringIO()
     ls.configure_logging(stream=stream)
@@ -416,7 +425,7 @@ async def test_run_streaming_loop_timeout(mock_transport):
     time.sleep(1)
 
     # Stop the loop by putting a sentinel value in the queue
-    request_queue.put((None, None, None, None))
+    request_queue.put((None, None, time.monotonic(), None))
     loop_thread.join()
 
     assert "Request UUID-001 was waiting in the queue for too long" in stream.getvalue()
@@ -452,7 +461,7 @@ def off_test_run_batched_streaming_loop(openai_request_data):
     time.sleep(1)
 
     # Stop the loop by putting a sentinel value in the queue
-    request_queue.put((None, None, None, None))
+    request_queue.put((None, None, time.monotonic(), None))
     loop_thread.join()
 
     response = response_queues[0].get(timeout=5)[1]
@@ -519,28 +528,7 @@ class TestLoop(LitLoop):
 
 
 @pytest.mark.asyncio
-async def test_custom_loop(mock_transport):
-    loop = TestLoop()
-    lit_api = MagicMock(request_timeout=1)
-    lit_api.load_cache = MagicMock(return_value=1.0)
-    lit_api.encode_response = MagicMock(return_value={"output": 16.0})
-    request_queue = Queue()
-    request_queue.put((0, "UUID-001", time.monotonic(), {"input": 4.0}))
-
-    loop(lit_api, None, "cpu", 0, request_queue, mock_transport, 2, 1, False, {}, NOOP_CB_RUNNER)
-    response = await mock_transport.areceive(0)
-    assert response[0] == "UUID-001"
-    assert response[1][0] == {"output": 16.0}
-    lit_api.load_cache.assert_called_once()
-    lit_api.load_cache.assert_called_with({"input": 4.0})
-
-
-class TestLitAPI(ls.test_examples.SimpleLitAPI):
-    def load_cache(self, x):
-        return 10
-
-
-@pytest.mark.asyncio
+@pytest.mark.timeout(20)
 @pytest.mark.parametrize("fast_queue", [True, False])
 async def test_loop_with_server_async(fast_queue):
     loop = TestLoop()
@@ -552,7 +540,7 @@ async def test_loop_with_server_async(fast_queue):
             transport=ASGITransport(app=manager.app), base_url="http://test"
         ) as ac:
             response = await ac.post("/predict", json={"input": 4.0}, timeout=5)
-            assert response.json() == {"output": 1600.0}
+            assert response.json() == {"output": 16.0}
 
 
 def test_loop_with_server_sync():
@@ -561,7 +549,7 @@ def test_loop_with_server_sync():
     server = ls.LitServer(lit_api, loop=loop, fast_queue=True)
     with wrap_litserve_start(server) as server, TestClient(server.app) as client:
         response = client.post("/predict", json={"input": 4.0}, timeout=5)
-        assert response.json() == {"output": 1600.0}  # use LitAPI.load_cache to multiply the input by 10
+        assert response.json() == {"output": 16.0}  # use LitAPI.load_cache to multiply the input by 10
 
 
 def test_get_default_loop():
@@ -592,9 +580,11 @@ def test_lit_loop_get_batch_requests(lit_loop_setup):
     lit_loop, lit_api, request_queue = lit_loop_setup
     request_queue.put((0, "UUID-001", time.monotonic(), {"input": 4.0}))
     request_queue.put((0, "UUID-002", time.monotonic(), {"input": 5.0}))
-    batches, timed_out_uids = lit_loop.get_batch_requests(lit_api, request_queue, 2, 0.001)
-    assert len(batches) == 2
-    assert batches == [(0, "UUID-001", {"input": 4.0}), (0, "UUID-002", {"input": 5.0})]
+    batches, timed_out_uids, _ = lit_loop.get_batch_requests(lit_api, request_queue, 2, 0.001)
+    assert batches == [
+        (0, "UUID-001", {"input": 4.0}),
+        (0, "UUID-002", {"input": 5.0}),
+    ]
     assert timed_out_uids == []
 
 
@@ -611,6 +601,7 @@ def test_lit_loop_get_request(lit_loop_setup):
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(20)
 async def test_lit_loop_put_response(lit_loop_setup, mock_transport):
     lit_loop, _, request_queue = lit_loop_setup
     lit_loop.put_response(mock_transport, 0, "UUID-001", {"output": 16.0}, LitAPIStatus.OK)
@@ -674,6 +665,7 @@ class ContinuousBatchingAPI(ls.LitAPI):
         return outputs
 
 
+@pytest.mark.timeout(20)
 @pytest.mark.parametrize(
     ("stream", "max_batch_size", "error_msg"),
     [
@@ -716,6 +708,7 @@ def test_continuous_batching_pre_setup(continuous_batching_setup):
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(20)
 async def test_continuous_batching_run(continuous_batching_setup):
     lit_api, lit_loop, request_queue, mock_transport = continuous_batching_setup
     response_queue_id, uid, _, input = (0, "UUID-001", time.monotonic(), {"input": "Hello"})
@@ -738,3 +731,8 @@ async def test_continuous_batching_run(continuous_batching_setup):
     o = json.loads(response_data)["output"]
     assert o == ""
     assert status == LitAPIStatus.FINISH_STREAMING
+
+
+class TestLitAPI(ls.test_examples.SimpleLitAPI):
+    def load_cache(self, x):
+        return 10

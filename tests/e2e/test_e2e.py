@@ -18,6 +18,7 @@ import time
 from functools import wraps
 
 import psutil
+import pytest
 import requests
 from openai import OpenAI
 
@@ -49,6 +50,7 @@ def e2e_from_file(filename):
     return decorator
 
 
+@pytest.mark.timeout(10)
 @e2e_from_file("tests/simple_server.py")
 def test_run():
     assert os.path.exists("client.py"), f"Expected client file to be created at {os.getcwd()} after starting the server"
@@ -57,6 +59,7 @@ def test_run():
     os.remove("client.py")
 
 
+@pytest.mark.timeout(10)
 @e2e_from_file("tests/simple_server_diff_port.py")
 def test_run_with_port():
     assert os.path.exists("client.py"), f"Expected client file to be created at {os.getcwd()} after starting the server"
@@ -70,6 +73,7 @@ def test_run_with_port():
     os.remove("client.py")
 
 
+@pytest.mark.timeout(10)
 @e2e_from_file("tests/e2e/default_api.py")
 def test_e2e_default_api():
     resp = requests.post("http://127.0.0.1:8000/predict", json={"input": 4.0}, headers=None)
@@ -77,6 +81,7 @@ def test_e2e_default_api():
     assert resp.json() == {"output": 16.0}, "tests/simple_server.py didn't return expected output"
 
 
+@pytest.mark.timeout(10)
 @e2e_from_file("tests/e2e/default_spec.py")
 def test_e2e_default_spec(openai_request_data):
     resp = requests.post("http://127.0.0.1:8000/v1/chat/completions", json=openai_request_data)
@@ -86,6 +91,7 @@ def test_e2e_default_spec(openai_request_data):
     assert output == expected, "tests/default_spec.py didn't return expected output"
 
 
+@pytest.mark.timeout(10)
 @e2e_from_file("tests/e2e/default_batching.py")
 def test_e2e_default_batching():
     resp = requests.post("http://127.0.0.1:8000/predict", json={"input": 4.0}, headers=None)
@@ -93,6 +99,7 @@ def test_e2e_default_batching():
     assert resp.json() == {"output": 16.0}, "tests/simple_server.py didn't return expected output"
 
 
+@pytest.mark.timeout(10)
 @e2e_from_file("tests/e2e/default_batched_streaming.py")
 def test_e2e_batched_streaming():
     resp = requests.post("http://127.0.0.1:8000/predict", json={"input": 4.0}, headers=None, stream=True)
@@ -107,6 +114,7 @@ def test_e2e_batched_streaming():
     assert {"output": 16.0} in outputs, "server didn't return expected output"
 
 
+@pytest.mark.timeout(10)
 @e2e_from_file("tests/e2e/default_openaispec.py")
 def test_openai_parity():
     client = OpenAI(
@@ -140,6 +148,7 @@ def test_openai_parity():
         )
 
 
+@pytest.mark.timeout(10)
 @e2e_from_file("tests/e2e/default_openaispec.py")
 def test_openai_parity_with_image_input():
     client = OpenAI(
@@ -183,6 +192,7 @@ def test_openai_parity_with_image_input():
         )
 
 
+@pytest.mark.timeout(10)
 @e2e_from_file("tests/e2e/default_openaispec.py")
 def test_openai_parity_with_audio_input(openai_request_data_with_audio_wav):
     client = OpenAI(
@@ -211,6 +221,7 @@ def test_openai_parity_with_audio_input(openai_request_data_with_audio_wav):
         )
 
 
+@pytest.mark.timeout(10)
 @e2e_from_file("tests/e2e/default_openaispec_tools.py")
 def test_openai_parity_with_tools():
     client = OpenAI(
@@ -269,6 +280,7 @@ def test_openai_parity_with_tools():
             )
 
 
+@pytest.mark.timeout(10)
 @e2e_from_file("tests/e2e/default_openai_with_batching.py")
 def test_e2e_openai_with_batching(openai_request_data):
     client = OpenAI(
@@ -287,6 +299,7 @@ def test_e2e_openai_with_batching(openai_request_data):
     ), f"Server didn't return expected output OpenAI client output: {response}"
 
 
+@pytest.mark.timeout(10)
 @e2e_from_file("tests/e2e/default_openaispec_response_format.py")
 def test_openai_parity_with_response_format():
     client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="lit")
@@ -338,6 +351,7 @@ def test_openai_parity_with_response_format():
         )
 
 
+@pytest.mark.timeout(10)
 @e2e_from_file("tests/e2e/default_single_streaming.py")
 def test_e2e_single_streaming():
     resp = requests.post("http://127.0.0.1:8000/predict", json={"input": 4.0}, headers=None, stream=True)
@@ -356,6 +370,7 @@ def test_e2e_single_streaming():
         assert output["output"] == expected_values[i], f"Intermediate output {i} is not expected value"
 
 
+@pytest.mark.timeout(10)
 @e2e_from_file("tests/e2e/default_openai_embedding_spec.py")
 def test_openai_embedding_parity():
     client = OpenAI(

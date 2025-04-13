@@ -40,9 +40,12 @@ class StreamingLoop(DefaultLoop):
         while True:
             try:
                 response_queue_id, uid, timestamp, x_enc = request_queue.get(timeout=1.0)
-                logger.debug("uid=%s", uid)
-            except (Empty, ValueError):
+            except Empty:
                 continue
+
+            # Check for sentinel value used in tests to stop the loop
+            if uid is None:
+                break
 
             if (lit_api.request_timeout and lit_api.request_timeout != -1) and (
                 time.monotonic() - timestamp > lit_api.request_timeout
@@ -57,6 +60,7 @@ class StreamingLoop(DefaultLoop):
                 )
                 continue
 
+            # If timeout is not enabled or request hasn't timed out, continue processing
             try:
                 context = {}
                 if hasattr(lit_spec, "populate_context"):
@@ -134,7 +138,7 @@ class BatchedStreamingLoop(DefaultLoop):
         callback_runner: CallbackRunner,
     ):
         while True:
-            batches, timed_out_uids = collate_requests(
+            batches, timed_out_uids, sentinel_found = collate_requests(
                 lit_api,
                 request_queue,
                 max_batch_size,
@@ -149,6 +153,10 @@ class BatchedStreamingLoop(DefaultLoop):
                 self.put_response(
                     transport, response_queue_id, uid, HTTPException(504, "Request timed out"), LitAPIStatus.ERROR
                 )
+
+            # Stop the loop if the sentinel was detected by collate_requests
+            if sentinel_found:
+                break
 
             if not batches:
                 continue

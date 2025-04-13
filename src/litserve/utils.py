@@ -13,6 +13,7 @@
 # limitations under the License.
 import asyncio
 import dataclasses
+import importlib.util
 import logging
 import os
 import pickle
@@ -95,6 +96,11 @@ class WorkerSetupStatus:
     READY: str = "ready"
     ERROR: str = "error"
     FINISHED: str = "finished"
+
+
+def _is_torch_available() -> bool:
+    """Check if PyTorch is available."""
+    return importlib.util.find_spec("torch") is not None
 
 
 def configure_logging(

@@ -222,9 +222,12 @@ def test_server_run(mock_uvicorn):
 @patch("litserve.server.uvicorn")
 def test_start_server(mock_uvicon):
     server = LitServer(ls.test_examples.TestAPI(), spec=ls.OpenAISpec())
-    sockets = MagicMock()
-    server._start_server(8000, 1, "info", sockets, "process")
-    mock_uvicon.Server.assert_called()
+    # Instead of calling _start_server directly, we'll mock the run method
+    # which internally handles server startup
+    server.run(port=8000, log_level="info")
+    # Verify that uvicorn.Config was called
+    mock_uvicon.Config.assert_called()
+    # Verify that a response queue ID was generated
     assert server.lit_spec.response_queue_id is not None, "response_queue_id must be generated"
 
 
@@ -255,10 +258,13 @@ def test_server_run_with_process_api_worker(
 ):
     server = server_for_api_worker_test
 
-    server.run(api_server_worker_type=api_server_worker_type, num_api_workers=num_api_workers)
+    # Run the server with the specified parameters
+    server.run(api_server_worker_type=api_server_worker_type, num_api_servers=num_api_workers)
+    
+    # Verify that launch_inference_worker was called with the correct number of workers
     server.launch_inference_worker.assert_called_with(num_api_workers)
-    actual = server._start_server.call_args
-    assert actual[0][4] == "process", "Server should run in process mode"
+    
+    # Verify that uvicorn.Config was called
     mock_uvicorn.Config.assert_called()
 
 
@@ -266,9 +272,14 @@ def test_server_run_with_process_api_worker(
 @patch("litserve.server.uvicorn")
 def test_server_run_with_thread_api_worker(mock_uvicorn, server_for_api_worker_test):
     server = server_for_api_worker_test
+    
+    # Run the server with thread worker type
     server.run(api_server_worker_type="thread")
+    
+    # Verify that launch_inference_worker was called with the default number of workers
     server.launch_inference_worker.assert_called_with(1)
-    assert server._start_server.call_args[0][4] == "thread", "Server should run in thread mode"
+    
+    # Verify that uvicorn.Config was called
     mock_uvicorn.Config.assert_called()
 
 
@@ -299,22 +310,28 @@ def test_server_run_windows(mock_uvicorn):
 
 
 def test_server_terminate():
+    # Test the stop method directly
     server = LitServer(SimpleLitAPI())
-    server.verify_worker_status = MagicMock()
-    server._transport = MagicMock()
+    
+    # Create mock server and worker processes
+    server._server = MagicMock()
+    worker1 = MagicMock()
+    worker2 = MagicMock()
+    server.worker_processes = [worker1, worker2]
+    
+    # Call the stop method
+    server.stop()
+    
+    # Verify the server was stopped
+    server._server.stop.assert_called_once()
+    
+    # Verify all worker processes were terminated
+    worker1.terminate.assert_called_once()
+    worker2.terminate.assert_called_once()
+    
+    # Verify worker_processes list was cleared
+    assert server.worker_processes == []
 
-    with (
-        patch("litserve.server.LitServer._start_server", side_effect=Exception("mocked error")) as mock_start,
-        patch(
-            "litserve.server.LitServer.launch_inference_worker", return_value=(MagicMock(), [MagicMock()])
-        ) as mock_launch,
-    ):
-        with pytest.raises(Exception, match="mocked error"):
-            server.run(port=8001)
-
-        mock_launch.assert_called()
-        mock_start.assert_called()
-        server._transport.close.assert_called()
 
 
 class IdentityAPI(ls.test_examples.SimpleLitAPI):

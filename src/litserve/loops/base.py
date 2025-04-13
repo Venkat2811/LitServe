@@ -45,9 +45,10 @@ def _inject_context(context: Union[List[dict], dict], func, *args, **kwargs):
 
 def collate_requests(
     lit_api: LitAPI, request_queue: Queue, max_batch_size: int, batch_timeout: float
-) -> Tuple[List, List]:
+) -> Tuple[List, List, bool]:
     payloads = []
     timed_out_uids = []
+    sentinel_found = False
     entered_at = time.monotonic()
     end_time = entered_at + batch_timeout
     apply_timeout = lit_api.request_timeout not in (-1, False)
@@ -56,13 +57,17 @@ def collate_requests(
         while len(payloads) < max_batch_size:
             try:
                 response_queue_id, uid, timestamp, x_enc = request_queue.get_nowait()
+                # Check for sentinel value used in tests to stop the loop
+                if uid is None:
+                    sentinel_found = True
+                    break
                 if apply_timeout and time.monotonic() - timestamp > lit_api.request_timeout:
                     timed_out_uids.append((response_queue_id, uid))
                 else:
                     payloads.append((response_queue_id, uid, x_enc))
             except Empty:
                 break
-        return payloads, timed_out_uids
+        return payloads, timed_out_uids, sentinel_found
 
     while time.monotonic() < end_time and len(payloads) < max_batch_size:
         remaining_time = end_time - time.monotonic()
@@ -71,6 +76,10 @@ def collate_requests(
 
         try:
             response_queue_id, uid, timestamp, x_enc = request_queue.get(timeout=min(remaining_time, 0.001))
+            # Check for sentinel value used in tests to stop the loop
+            if uid is None:
+                sentinel_found = True
+                break
             if apply_timeout and time.monotonic() - timestamp > lit_api.request_timeout:
                 timed_out_uids.append((response_queue_id, uid))
             else:
@@ -79,7 +88,7 @@ def collate_requests(
         except Empty:
             continue
 
-    return payloads, timed_out_uids
+    return payloads, timed_out_uids, sentinel_found
 
 
 class _BaseLoop(ABC):
@@ -225,13 +234,13 @@ class LitLoop(_BaseLoop):
         self._context = {}
 
     def get_batch_requests(self, lit_api: LitAPI, request_queue: Queue, max_batch_size: int, batch_timeout: float):
-        batches, timed_out_uids = collate_requests(
+        batches, timed_out_uids, sentinel_found = collate_requests(
             lit_api,
             request_queue,
             max_batch_size,
             batch_timeout,
         )
-        return batches, timed_out_uids
+        return batches, timed_out_uids, sentinel_found
 
     def get_request(self, request_queue: Queue, block: bool = True, timeout: Optional[float] = None):
         try:

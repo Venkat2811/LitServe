@@ -14,7 +14,7 @@
 import logging
 import time
 from queue import Empty, Queue
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 
 from fastapi import HTTPException
 
@@ -42,6 +42,10 @@ class SingleLoop(DefaultLoop):
                 response_queue_id, uid, timestamp, x_enc = request_queue.get(timeout=1.0)
             except (Empty, ValueError):
                 continue
+
+            # Check for sentinel value used in tests to stop the loop
+            if uid is None:
+                break
 
             if (lit_api.request_timeout and lit_api.request_timeout != -1) and (
                 time.monotonic() - timestamp > lit_api.request_timeout
@@ -146,7 +150,7 @@ class BatchedLoop(DefaultLoop):
         callback_runner: CallbackRunner,
     ):
         while True:
-            batches, timed_out_uids = collate_requests(
+            batches, timed_out_uids, sentinel_found = collate_requests(
                 lit_api,
                 request_queue,
                 max_batch_size,
@@ -162,6 +166,10 @@ class BatchedLoop(DefaultLoop):
                 self.put_response(
                     transport, response_queue_id, uid, HTTPException(504, "Request timed out"), LitAPIStatus.ERROR
                 )
+
+            # Stop the loop if the sentinel was detected by collate_requests
+            if sentinel_found:
+                break
 
             if not batches:
                 continue
@@ -251,3 +259,143 @@ class BatchedLoop(DefaultLoop):
             batch_timeout,
             callback_runner,
         )
+
+
+def simple_unified_loop(
+    lit_api: LitAPI,
+    lit_spec: Optional[LitSpec], 
+    device: str,
+    worker_id: int,
+    request_queue: Any,
+    response_transport: Any,
+    max_batch_size: int,
+    batch_timeout: float,
+    stream: bool, 
+    setup_status: Dict,
+    has_preprocess: bool,
+):
+    """Worker loop for 'simple' execution mode, running all steps sequentially with batching."""
+    logger.info(f"Default worker {worker_id} starting on device {device}.")
+    requires_batch = lit_api.batch.__code__ is not LitAPI.batch.__code__
+    requires_unbatch = lit_api.unbatch.__code__ is not LitAPI.unbatch.__code__
+
+    try:
+        lit_api.setup(device)
+        if _is_torch_available():
+            torch.device(device)
+            torch.cuda.empty_cache()
+        setup_status[worker_id] = WorkerSetupStatus.READY
+        logger.info(f"Default worker {worker_id} ready on device {device}.")
+    except Exception as e:
+        logger.error(f"Default worker {worker_id} setup failed: {e}", exc_info=True)
+        setup_status[worker_id] = WorkerSetupStatus.FAILED
+        return
+
+    while True:
+        try:
+            # 1. Collate requests into batches
+            batches, timed_out_uids = collate_requests(
+                lit_api=lit_api,
+                request_queue=request_queue,
+                max_batch_size=max_batch_size,
+                batch_timeout=batch_timeout,
+            )
+
+            # Handle timed-out requests
+            for response_queue_id, uid, timestamp in timed_out_uids:
+                logger.error(
+                    f"Request {uid} timed out waiting in queue (timeout={lit_api.request_timeout}s). Worker {worker_id}."
+                )
+                try:
+                    # Send timeout error back
+                    error_payload = HTTPException(504, "Request timed out in queue")
+                    response_transport.put((response_queue_id, uid, timestamp, error_payload))
+                except Exception as send_e:
+                    logger.error(f"Default worker {worker_id} failed to send timeout error for {uid}: {send_e}")
+
+            if not batches:
+                # No batches ready, continue loop (collate_requests handles waiting)
+                continue
+
+            logger.debug(f"Default worker {worker_id} processing batch of size {len(batches)}.")
+            response_queue_ids, uids, timestamps, inputs_enc = zip(*batches)
+            num_inputs = len(inputs_enc)
+            outputs_enc = [None] * num_inputs # Placeholder for results or errors
+            batch_processed_successfully = True
+
+            try:
+                # 2. Decode requests
+                # TODO: Add context injection if LitSpec is passed and used
+                decoded_inputs = [lit_api.decode_request(x_enc) for x_enc in inputs_enc]
+
+                # 3. Preprocess (optional)
+                if has_preprocess:
+                    preprocessed_inputs = [lit_api.preprocess(x) for x in decoded_inputs]
+                else:
+                    preprocessed_inputs = decoded_inputs
+
+                # 4. Batch for prediction
+                if requires_batch:
+                    batched_input_for_predict = lit_api.batch(preprocessed_inputs)
+                else:
+                    # If batch size is 1, or no batch method, pass single item or list
+                    if max_batch_size == 1:
+                        batched_input_for_predict = preprocessed_inputs[0]
+                    else:
+                        batched_input_for_predict = preprocessed_inputs
+
+                # 5. Predict
+                predict_start_time = time.monotonic()
+                results = lit_api.predict(batched_input_for_predict)
+                predict_duration = time.monotonic() - predict_start_time
+                logger.debug(f"Default worker {worker_id} predict duration: {predict_duration:.4f}s for batch size {num_inputs}")
+
+                # 6. Unbatch results
+                if requires_unbatch:
+                    unbatched_outputs = lit_api.unbatch(results)
+                else:
+                    if max_batch_size == 1:
+                        unbatched_outputs = [results] # Ensure list
+                    else:
+                        if not isinstance(results, (list, tuple)) or len(results) != num_inputs:
+                             logger.warning(
+                                f"Default worker {worker_id}: Predict output count ({len(results) if isinstance(results, (list, tuple)) else 'N/A'}) does not match batch size ({num_inputs}). "
+                                f"Ensure predict returns list/tuple or implement unbatch."
+                            )
+                             if isinstance(results, (list, tuple)):
+                                 unbatched_outputs = results
+                             else:
+                                raise TypeError(f"Expected predict output to be list/tuple for batch size > 1, got {type(results)}")
+                        else:
+                            unbatched_outputs = results
+            
+                if len(unbatched_outputs) != num_inputs:
+                     raise RuntimeError(f"Unbatched output count ({len(unbatched_outputs)}) does not match batch size ({num_inputs}).")
+
+                # 7. Encode responses
+                outputs_enc = [lit_api.encode_response(y) for y in unbatched_outputs]
+
+            except Exception as e:
+                batch_processed_successfully = False
+                logger.error(f"Default worker {worker_id} failed processing batch: {e}", exc_info=True)
+                # Fill outputs_enc with error payload for all items in the batch
+                # TODO: Define a better error format
+                error_payload = e if isinstance(e, HTTPException) else Exception(f"Processing failed in worker {worker_id}: {e}")
+                outputs_enc = [error_payload] * num_inputs
+
+            # 8. Send responses (or errors)
+            for i in range(num_inputs):
+                try:
+                    response_payload = outputs_enc[i]
+                    response_transport.put((response_queue_ids[i], uids[i], timestamps[i], response_payload))
+                except Exception as send_e:
+                     logger.error(f"Default worker {worker_id} failed to send response/error for {uids[i]}: {send_e}")
+        except (KeyboardInterrupt, SystemExit):
+            logger.info(f"Default worker {worker_id} received exit signal.")
+            break
+        except Exception as e:
+             # Catch-all for unexpected errors outside batch processing (e.g., in collate_requests itself?) unlikely
+             logger.error(f"Default worker {worker_id} encountered unexpected error in main loop: {e}", exc_info=True)
+             time.sleep(1)
+
+    logger.info(f"Default worker {worker_id} stopped.")

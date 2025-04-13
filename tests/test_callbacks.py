@@ -40,14 +40,31 @@ def test_callback_runner():
     assert cb_runner._callbacks == [cb], "Callback not added to runner"
 
 
-def test_callback(capfd):
-    lit_api = ls.test_examples.SimpleLitAPI()
-    server = ls.LitServer(lit_api, callbacks=[PredictionTimeLogger()])
+# Create a custom callback that prints directly to stdout for testing
+class TestPredictionTimeLogger(PredictionTimeLogger):
+    def on_before_predict(self, lit_api):
+        self._start_time = time.perf_counter()
+        
+    def on_after_predict(self, lit_api):
+        elapsed = time.perf_counter() - self._start_time
+        # Print directly to stdout for testing
+        print(f"Prediction took {elapsed:.2f} seconds", flush=True)
 
+
+def test_callback(capfd):
+    
+    lit_api = ls.test_examples.SimpleLitAPI()
+    # Use our custom callback
+    server = ls.LitServer(lit_api, callbacks=[TestPredictionTimeLogger()])
+    
+    # Make sure callbacks are set on the API instance
+    lit_api.callbacks = server._callback_runner._callbacks
+    
     with wrap_litserve_start(server) as server, TestClient(server.app) as client:
         response = client.post("/predict", json={"input": 4.0})
         assert response.json() == {"output": 16.0}
-
+    
+    # Read the captured output
     captured = capfd.readouterr()
     pattern = r"Prediction took \d+\.\d{2} seconds"
     assert re.search(pattern, captured.out), f"Expected pattern not found in output: {captured.out}"

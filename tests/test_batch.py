@@ -173,6 +173,18 @@ class FakeResponseQueue:
     def put(self, *args, block=True, timeout=None):
         raise StopIteration("exit loop")
 
+class FakeTransport:
+    def __init__(self, response_queues):
+        self.response_queues = response_queues
+    
+    def send(self, data, consumer_id=None):
+        # Find the appropriate queue based on consumer_id
+        if consumer_id is not None and consumer_id < len(self.response_queues):
+            self.response_queues[consumer_id].put(data)
+        else:
+            # Default to the first queue if consumer_id is invalid
+            self.response_queues[0].put(data)
+
 
 def test_batched_loop():
     requests_queue = Queue()
@@ -189,12 +201,15 @@ def test_batched_loop():
     lit_api_mock.encode_response = MagicMock(side_effect=lambda x: {"output": x})
 
     loop = BatchedLoop()
+    response_queues = [FakeResponseQueue()]
+    transport = FakeTransport(response_queues)
+    
     with patch("pickle.dumps", side_effect=StopIteration("exit loop")), pytest.raises(StopIteration, match="exit loop"):
         loop.run_batched_loop(
             lit_api_mock,
             lit_api_mock,
             requests_queue,
-            [FakeResponseQueue()],
+            transport,
             max_batch_size=2,
             batch_timeout=4,
             callback_runner=NOOP_CB_RUNNER,
@@ -221,11 +236,12 @@ def test_collate_requests(batch_timeout, batch_size):
     request_queue = Queue()
     for i in range(batch_size):
         request_queue.put((i, f"uuid-abc-{i}", time.monotonic(), i))  # response_queue_id, uid, timestamp, x_enc
-    payloads, timed_out_uids = collate_requests(
+    payloads, timed_out_uids, sentinel_found = collate_requests(
         api, request_queue, max_batch_size=batch_size, batch_timeout=batch_timeout
     )
     assert len(payloads) == batch_size, f"Should have {batch_size} payloads, got {len(payloads)}"
     assert len(timed_out_uids) == 0, "No timed out uids"
+    assert sentinel_found == False, "No sentinel should be found"
 
 
 class BatchSizeMismatchAPI(SimpleBatchLitAPI):

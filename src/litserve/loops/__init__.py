@@ -18,6 +18,7 @@ from litserve.loops.continuous_batching_loop import ContinuousBatchingLoop, Outp
 from litserve.loops.loops import (
     get_default_loop,
     inference_worker,
+    simple_unified_loop,
 )
 from litserve.loops.simple_loops import BatchedLoop, SingleLoop
 from litserve.loops.streaming_loops import BatchedStreamingLoop, StreamingLoop
@@ -29,6 +30,7 @@ __all__ = [
     "LitLoop",
     "get_default_loop",
     "inference_worker",
+    "simple_unified_loop",
     "Output",
     "SingleLoop",
     "BatchedLoop",

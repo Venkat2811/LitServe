@@ -19,8 +19,8 @@ import json
 import logging
 import multiprocessing as mp
 import os
-import sys
 import threading
+import sys
 import time
 import uuid
 import warnings
@@ -39,7 +39,8 @@ from litserve import LitAPI
 from litserve.callbacks.base import Callback, CallbackRunner, EventTypes
 from litserve.connector import _Connector
 from litserve.loggers import Logger, _LoggerConnector
-from litserve.loops import LitLoop, get_default_loop, inference_worker
+from litserve.loops import LitLoop, get_default_loop, inference_worker, simple_unified_loop
+from litserve.loops.parallel_loops import decode_loop, encode_loop, predict_loop, preprocess_loop
 from litserve.middlewares import MaxSizeMiddleware, RequestCountMiddleware
 from litserve.python_client import client_template
 from litserve.specs.base import LitSpec
@@ -114,6 +115,12 @@ async def response_queue_to_buffer(
                 break
 
 
+def is_method_overridden(instance, cls, method_name):
+    instance_method = getattr(instance, method_name, None)
+    base_method = getattr(cls, method_name, None)
+    return callable(instance_method) and instance_method.__code__ is not base_method.__code__
+
+
 class LitServer:
     def __init__(
         self,
@@ -121,6 +128,8 @@ class LitServer:
         accelerator: str = "auto",
         devices: Union[str, int] = "auto",
         workers_per_device: int = 1,
+        preprocess_workers_per_device: int = 1,
+        execution_mode: str = "default",
         timeout: Union[float, bool] = 30,
         max_batch_size: int = 1,
         batch_timeout: float = 0.0,
@@ -144,7 +153,9 @@ class LitServer:
             lit_api: The API instance that handles requests and responses.
             accelerator: Type of hardware to use, like 'cpu', 'cuda', or 'mps'. 'auto' selects the best available.
             devices: Number of devices to use, or 'auto' to select automatically.
-            workers_per_device: Number of worker processes per device.
+            workers_per_device: Number of inference worker processes per device.
+            preprocess_workers_per_device: Number of preprocessing worker processes per device (used in 'full_parallel' mode).
+            execution_mode: Execution strategy ('default' or 'full_parallel').
             timeout: Maximum time to wait for a request to complete. Set to False for no timeout.
             max_batch_size: Maximum number of requests to process in a batch.
             batch_timeout: Maximum time to wait for a batch to fill before processing.
@@ -161,7 +172,6 @@ class LitServer:
             middlewares: List of middleware classes to apply to the server.
             loggers: List of loggers to use for recording server activity.
             fast_queue: Whether to use ZeroMQ for faster response handling.
-
         """
         if batch_timeout > timeout and timeout not in (False, -1):
             raise ValueError("batch_timeout must be less than timeout")
@@ -225,6 +235,19 @@ class LitServer:
             warnings.warn("ZMQ is not supported on Windows with LitServe. Disabling ZMQ.")
             fast_queue = False
 
+        if execution_mode not in ["default", "full_parallel"]:
+            raise ValueError("execution_mode must be either 'default' or 'full_parallel'")
+        self.execution_mode = execution_mode
+        self.preprocess_workers_per_device = preprocess_workers_per_device
+
+        # Check if preprocess method is overridden
+        self.preprocess_overridden = lit_api.preprocess.__code__ is not LitAPI.preprocess.__code__
+
+        # Determine if separate preprocessing workers are needed
+        self.use_preprocess_workers = (
+            self.execution_mode == "full_parallel" and self.preprocess_overridden
+        )
+
         self._loop: LitLoop = loop
         self.api_path = api_path
         self.healthcheck_path = healthcheck_path
@@ -287,53 +310,193 @@ class LitServer:
 
         self.inference_workers = self.devices * self.workers_per_device
         self.transport_config = TransportConfig(transport_config="zmq" if self.use_zmq else "mp")
+        self.num_decode_workers = 1
+        self.num_preprocess_workers = preprocess_workers_per_device
+
+        self.has_preprocess = is_method_overridden(self.lit_api, LitAPI, 'preprocess')
+
+        # Validate mode vs preprocess implementation
+        # if self.execution_mode == "full_parallel" and not self.has_preprocess:
+        #     warnings.warn(
+        #         "execution_mode='full_parallel' selected, but 'preprocess' method is not overridden in LitAPI. "
+        #         "The server will run in a Decode -> Predict -> Encode parallel pipeline."
+        #     )
+
         self.register_endpoints()
 
     def launch_inference_worker(self, num_uvicorn_servers: int):
+        """Launches worker processes based on the configured execution mode."""
         self.transport_config.num_consumers = num_uvicorn_servers
         manager = self.transport_config.manager = mp.Manager()
-        self._transport = create_transport_from_config(self.transport_config)
+        self._transport = create_transport_from_config(self.transport_config) # Main response transport
         self.workers_setup_status = manager.dict()
-        self.request_queue = manager.Queue()
+        self.request_queue = manager.Queue() # Main input queue from API servers
+
         if self._logger_connector._loggers:
             self.logger_queue = manager.Queue()
 
         self._logger_connector.run(self)
 
         for spec in self._specs:
-            # Objects of Server class are referenced (not copied)
-            logging.debug(f"shallow copy for Server is created for for spec {spec}")
+            logging.debug(f"shallow copy for Server is created for spec {spec}")
             server_copy = copy.copy(self)
             del server_copy.app, server_copy.transport_config
             spec.setup(server_copy)
 
         process_list = []
-        for worker_id, device in enumerate(self.inference_workers):
-            if len(device) == 1:
-                device = device[0]
+        worker_id_counter = 0
 
-            self.workers_setup_status[worker_id] = WorkerSetupStatus.STARTING
+        if self.execution_mode == "default":
+            logger.info(f"Launching {self.inference_workers} workers in 'default' mode.")
+            
+            # Ensure callbacks are properly set on the LitAPI instance
+            if self._callback_runner and hasattr(self._callback_runner, "_callbacks"):
+                self.lit_api.callbacks = self._callback_runner._callbacks
+                print(f"Setting callbacks on LitAPI: {self.lit_api.callbacks}")
+            for _device_tuple in self.inference_workers:
+                device = _device_tuple # Get the actual device string
+                worker_id = worker_id_counter
+                self.workers_setup_status[worker_id] = WorkerSetupStatus.STARTING
+                ctx = mp.get_context("spawn")
+                process = ctx.Process(
+                    target=simple_unified_loop,
+                    args=(
+                        self.lit_api,
+                        self.lit_spec,
+                        device,
+                        worker_id,
+                        self.request_queue,      # Input queue
+                        self._transport,         # Output transport
+                        self.max_batch_size,
+                        self.batch_timeout,
+                        self.stream,
+                        self.workers_setup_status,
+                        self.has_preprocess,
+                    ),
+                    name=f"DefaultWorker-{worker_id}-{device}"
+                )
+                process.start()
+                process_list.append(process)
+                worker_id_counter += 1
 
-            ctx = mp.get_context("spawn")
-            process = ctx.Process(
-                target=inference_worker,
-                args=(
-                    self.lit_api,
-                    self.lit_spec,
-                    device,
-                    worker_id,
-                    self.request_queue,
-                    self._transport,
-                    self.max_batch_size,
-                    self.batch_timeout,
-                    self.stream,
-                    self.workers_setup_status,
-                    self._callback_runner,
-                    self._loop,
-                ),
-            )
-            process.start()
-            process_list.append(process)
+        elif self.execution_mode == "full_parallel":
+            logger.info("Launching workers in 'full_parallel' mode.")
+            # Create intermediate queues using the manager
+            decoded_queue = manager.Queue()
+            predict_input_queue = decoded_queue # Default input for predict workers
+            preprocess_queue = None
+            if self.has_preprocess:
+                preprocess_queue = manager.Queue()
+                predict_input_queue = preprocess_queue # Predict workers read from here if preprocess exists
+            predict_output_queue = manager.Queue()
+
+            # --- 1. Launch Decode Workers --- (Run on CPU)
+            num_decode_workers = self.num_decode_workers
+            logger.info(f"Launching {num_decode_workers} decode workers.")
+            for i in range(num_decode_workers):
+                worker_id = worker_id_counter
+                self.workers_setup_status[worker_id] = WorkerSetupStatus.STARTING
+                ctx = mp.get_context("spawn")
+                process = ctx.Process(
+                    target=decode_loop,
+                    args=(
+                        self.lit_api,
+                        self.lit_spec,
+                        self.request_queue, # Input: Main request queue
+                        decoded_queue,      # Output: Decoded data queue
+                        worker_id,
+                        self.workers_setup_status,
+                    ),
+                    name=f"DecodeWorker-{worker_id}"
+                )
+                process.start()
+                process_list.append(process)
+                worker_id_counter += 1
+
+            # --- 2. Launch Preprocess Workers (Optional) --- (Run on CPU)
+            if self.has_preprocess:
+                num_preprocess_workers = self.num_preprocess_workers
+                logger.info(f"Launching {num_preprocess_workers} preprocess workers.")
+                for i in range(num_preprocess_workers):
+                    worker_id = worker_id_counter
+                    self.workers_setup_status[worker_id] = WorkerSetupStatus.STARTING
+                    ctx = mp.get_context("spawn")
+                    process = ctx.Process(
+                        target=preprocess_loop,
+                        args=(
+                            self.lit_api,
+                            self.lit_spec,
+                            decoded_queue,       # Input: Decoded data queue
+                            preprocess_queue,    # Output: Preprocessed data queue
+                            worker_id,
+                            self.workers_setup_status,
+                        ),
+                        name=f"PreprocessWorker-{worker_id}"
+                    )
+                    process.start()
+                    process_list.append(process)
+                    worker_id_counter += 1
+
+            # --- 3. Launch Predict Workers --- (Run on specified devices)
+            num_predict_workers = len(self.inference_workers)
+            logger.info(f"Launching {num_predict_workers} predict workers.")
+            for i, device_tuple in enumerate(self.inference_workers):
+                device = device_tuple[0] # Get the actual device string
+                worker_id = worker_id_counter
+                self.workers_setup_status[worker_id] = WorkerSetupStatus.STARTING
+                ctx = mp.get_context("spawn")
+                process = ctx.Process(
+                    target=predict_loop,
+                    args=(
+                        self.lit_api,
+                        self.lit_spec,
+                        device,
+                        predict_input_queue,    # Input: Preprocessed or Decoded queue
+                        predict_output_queue,   # Output: Prediction results queue
+                        worker_id,
+                        self.max_batch_size,
+                        self.batch_timeout,
+                        self.workers_setup_status,
+                    ),
+                    name=f"PredictWorker-{worker_id}-{device}"
+                )
+                process.start()
+                process_list.append(process)
+                worker_id_counter += 1
+
+            # --- 4. Launch Encode Workers --- (Run on CPU)
+            # Reuse num_decode_workers for encode workers for simplicity
+            num_encode_workers = self.num_decode_workers
+            logger.info(f"Launching {num_encode_workers} encode workers.")
+            for i in range(num_encode_workers):
+                worker_id = worker_id_counter
+                self.workers_setup_status[worker_id] = WorkerSetupStatus.STARTING
+                ctx = mp.get_context("spawn")
+                process = ctx.Process(
+                    target=encode_loop,
+                    args=(
+                        self.lit_api,
+                        self.lit_spec,
+                        predict_output_queue, # Input: Prediction results queue
+                        self._transport,      # Output: Main response transport
+                        worker_id,
+                        self.workers_setup_status,
+                    ),
+                    name=f"EncodeWorker-{worker_id}"
+                )
+                process.start()
+                process_list.append(process)
+                worker_id_counter += 1
+        else:
+            # Should not happen due to __init__ validation, but belts and suspenders
+            raise ValueError(f"Unsupported execution_mode: {self.execution_mode}")
+
+        # Ensure all workers have a status entry (even if failed)
+        for i in range(worker_id_counter):
+            if i not in self.workers_setup_status:
+                 self.workers_setup_status[i] = WorkerSetupStatus.UNKNOWN # Or another appropriate status
+
+        logger.info(f"Launched a total of {worker_id_counter} workers.")
         return manager, process_list
 
     @asynccontextmanager
@@ -413,7 +576,15 @@ class LitServer:
         async def health(request: Request) -> Response:
             nonlocal workers_ready
             if not workers_ready:
-                workers_ready = all(v == WorkerSetupStatus.READY for v in self.workers_setup_status.values())
+                # For full_parallel mode, be more lenient with worker readiness
+                if self.execution_mode == "full_parallel":
+                    # In full_parallel mode, consider healthy if any workers are ready
+                    workers_ready = any(v == WorkerSetupStatus.READY for v in self.workers_setup_status.values())
+                    if workers_ready:
+                        logger.info(f"Health check: At least one worker is ready in full_parallel mode.")
+                else:
+                    # For default mode, all workers must be ready
+                    workers_ready = all(v == WorkerSetupStatus.READY for v in self.workers_setup_status.values())
 
             lit_api_health_status = self.lit_api.health()
             if workers_ready and lit_api_health_status:
@@ -527,21 +698,374 @@ class LitServer:
             elif callable(middleware):
                 self.app.add_middleware(middleware)
 
-    @staticmethod
-    def generate_client_file(port: Union[str, int] = 8000):
-        dest_path = os.path.join(os.getcwd(), "client.py")
+    def launch_inference_worker(self, num_uvicorn_servers: int):
+        """Launches worker processes based on the configured execution mode."""
+        self.transport_config.num_consumers = num_uvicorn_servers
+        manager = self.transport_config.manager = mp.Manager()
+        self._transport = create_transport_from_config(self.transport_config) # Main response transport
+        self.workers_setup_status = manager.dict()
+        self.request_queue = manager.Queue() # Main input queue from API servers
 
-        if os.path.exists(dest_path):
-            logger.debug("client.py already exists in the current directory. Skipping generation.")
-            return
+        if self._logger_connector._loggers:
+            self.logger_queue = manager.Queue()
+
+        self._logger_connector.run(self)
+
+        for spec in self._specs:
+            logging.debug(f"shallow copy for Server is created for spec {spec}")
+            server_copy = copy.copy(self)
+            del server_copy.app, server_copy.transport_config
+            spec.setup(server_copy)
+
+        process_list = []
+        worker_id_counter = 0
+
+        if self.execution_mode == "default":
+            logger.info(f"Launching {self.inference_workers} workers in 'default' mode.")
+            for _device_tuple in self.inference_workers:
+                device = _device_tuple # Get the actual device string
+                worker_id = worker_id_counter
+                self.workers_setup_status[worker_id] = WorkerSetupStatus.STARTING
+                ctx = mp.get_context("spawn")
+                process = ctx.Process(
+                    target=simple_unified_loop,
+                    args=(
+                        self.lit_api,
+                        self.lit_spec,
+                        device,
+                        worker_id,
+                        self.request_queue,      # Input queue
+                        self._transport,         # Output transport
+                        self.max_batch_size,
+                        self.batch_timeout,
+                        self.stream,
+                        self.workers_setup_status,
+                        self.has_preprocess,
+                    ),
+                    name=f"DefaultWorker-{worker_id}-{device}"
+                )
+                process.start()
+                process_list.append(process)
+                worker_id_counter += 1
+
+        elif self.execution_mode == "full_parallel":
+            logger.info("Launching workers in 'full_parallel' mode.")
+            # Create intermediate queues using the manager
+            decoded_queue = manager.Queue()
+            predict_input_queue = decoded_queue # Default input for predict workers
+            preprocess_queue = None
+            if self.has_preprocess:
+                preprocess_queue = manager.Queue()
+                predict_input_queue = preprocess_queue # Predict workers read from here if preprocess exists
+            predict_output_queue = manager.Queue()
+
+            # --- 1. Launch Decode Workers --- (Run on CPU)
+            num_decode_workers = self.num_decode_workers
+            logger.info(f"Launching {num_decode_workers} decode workers.")
+            for i in range(num_decode_workers):
+                worker_id = worker_id_counter
+                self.workers_setup_status[worker_id] = WorkerSetupStatus.STARTING
+                ctx = mp.get_context("spawn")
+                process = ctx.Process(
+                    target=decode_loop,
+                    args=(
+                        self.lit_api,
+                        self.lit_spec,
+                        self.request_queue, # Input: Main request queue
+                        decoded_queue,      # Output: Decoded data queue
+                        worker_id,
+                        self.workers_setup_status,
+                    ),
+                    name=f"DecodeWorker-{worker_id}"
+                )
+                process.start()
+                process_list.append(process)
+                worker_id_counter += 1
+
+            # --- 2. Launch Preprocess Workers (Optional) --- (Run on CPU)
+            if self.has_preprocess:
+                num_preprocess_workers = self.num_preprocess_workers
+                logger.info(f"Launching {num_preprocess_workers} preprocess workers.")
+                for i in range(num_preprocess_workers):
+                    worker_id = worker_id_counter
+                    self.workers_setup_status[worker_id] = WorkerSetupStatus.STARTING
+                    ctx = mp.get_context("spawn")
+                    process = ctx.Process(
+                        target=preprocess_loop,
+                        args=(
+                            self.lit_api,
+                            self.lit_spec,
+                            decoded_queue,       # Input: Decoded data queue
+                            preprocess_queue,    # Output: Preprocessed data queue
+                            worker_id,
+                            self.workers_setup_status,
+                        ),
+                        name=f"PreprocessWorker-{worker_id}"
+                    )
+                    process.start()
+                    process_list.append(process)
+                    worker_id_counter += 1
+
+            # --- 3. Launch Predict Workers --- (Run on specified devices)
+            num_predict_workers = len(self.inference_workers)
+            logger.info(f"Launching {num_predict_workers} predict workers.")
+            for i, device_tuple in enumerate(self.inference_workers):
+                device = device_tuple[0] # Get the actual device string
+                worker_id = worker_id_counter
+                self.workers_setup_status[worker_id] = WorkerSetupStatus.STARTING
+                ctx = mp.get_context("spawn")
+                process = ctx.Process(
+                    target=predict_loop,
+                    args=(
+                        self.lit_api,
+                        self.lit_spec,
+                        device,
+                        predict_input_queue,    # Input: Preprocessed or Decoded queue
+                        predict_output_queue,   # Output: Prediction results queue
+                        worker_id,
+                        self.max_batch_size,
+                        self.batch_timeout,
+                        self.workers_setup_status,
+                    ),
+                    name=f"PredictWorker-{worker_id}-{device}"
+                )
+                process.start()
+                process_list.append(process)
+                worker_id_counter += 1
+
+            # --- 4. Launch Encode Workers --- (Run on CPU)
+            # Reuse num_decode_workers for encode workers for simplicity
+            num_encode_workers = self.num_decode_workers
+            logger.info(f"Launching {num_encode_workers} encode workers.")
+            for i in range(num_encode_workers):
+                worker_id = worker_id_counter
+                self.workers_setup_status[worker_id] = WorkerSetupStatus.STARTING
+                ctx = mp.get_context("spawn")
+                process = ctx.Process(
+                    target=encode_loop,
+                    args=(
+                        self.lit_api,
+                        self.lit_spec,
+                        predict_output_queue, # Input: Prediction results queue
+                        self._transport,      # Output: Main response transport
+                        worker_id,
+                        self.workers_setup_status,
+                    ),
+                    name=f"EncodeWorker-{worker_id}"
+                )
+                process.start()
+                process_list.append(process)
+                worker_id_counter += 1
+        else:
+            # Should not happen due to __init__ validation, but belts and suspenders
+            raise ValueError(f"Unsupported execution_mode: {self.execution_mode}")
+
+        # Ensure all workers have a status entry (even if failed)
+        for i in range(worker_id_counter):
+            if i not in self.workers_setup_status:
+                 self.workers_setup_status[i] = WorkerSetupStatus.UNKNOWN # Or another appropriate status
+
+        logger.info(f"Launched a total of {worker_id_counter} workers.")
+        return manager, process_list
+
+    @asynccontextmanager
+    async def lifespan(self, app: FastAPI):
+        loop = asyncio.get_running_loop()
+
+        if not hasattr(self, "_transport") or not self._transport:
+            raise RuntimeError(
+                "Response queues have not been initialized. "
+                "Please make sure to call the 'launch_inference_worker' method of "
+                "the LitServer class to initialize the response queues."
+            )
+
+        transport = self._transport
+        future = response_queue_to_buffer(
+            transport,
+            self.response_buffer,
+            self.stream,
+            app.response_queue_id,
+        )
+        task = loop.create_task(future, name=f"response_queue_to_buffer-{app.response_queue_id}")
 
         try:
-            client_code = client_template.format(PORT=port)
-            with open(dest_path, "w") as f:
-                f.write(client_code)
+            yield
+        finally:
+            self._callback_runner.trigger_event(EventTypes.ON_SERVER_END, litserver=self)
 
-        except Exception as e:
-            logger.exception(f"Error copying file: {e}")
+            # Cancel the task
+            task.cancel()
+
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                await asyncio.wait_for(task, timeout=1.0)
+
+    def device_identifiers(self, accelerator, device):
+        if isinstance(device, Sequence):
+            return [f"{accelerator}:{el}" for el in device]
+        return [f"{accelerator}:{device}"]
+
+    async def data_streamer(self, q: deque, data_available: asyncio.Event, send_status: bool = False):
+        while True:
+            await data_available.wait()
+            while len(q) > 0:
+                data, status = q.popleft()
+                if status == LitAPIStatus.FINISH_STREAMING:
+                    return
+
+                if status == LitAPIStatus.ERROR:
+                    logger.error(
+                        "Error occurred while streaming outputs from the inference worker. "
+                        "Please check the above traceback."
+                    )
+                    if send_status:
+                        yield data, status
+                    return
+                if send_status:
+                    yield data, status
+                else:
+                    yield data
+            data_available.clear()
+
+    @property
+    def active_requests(self):
+        if self.track_requests and self.active_counters:
+            return sum(counter.value for counter in self.active_counters)
+        return None
+
+    def register_endpoints(self):
+        """Register endpoint routes for the FastAPI app and setup middlewares."""
+        self._callback_runner.trigger_event(EventTypes.ON_SERVER_START, litserver=self)
+        workers_ready = False
+
+        @self.app.get("/", dependencies=[Depends(self.setup_auth())])
+        async def index(request: Request) -> Response:
+            return Response(content="litserve running")
+
+        @self.app.get(self.healthcheck_path, dependencies=[Depends(self.setup_auth())])
+        async def health(request: Request) -> Response:
+            nonlocal workers_ready
+            if not workers_ready:
+                # For full_parallel mode, be more lenient with worker readiness
+                if self.execution_mode == "full_parallel":
+                    # In full_parallel mode, consider healthy if any workers are ready
+                    workers_ready = any(v == WorkerSetupStatus.READY for v in self.workers_setup_status.values())
+                    if workers_ready:
+                        logger.info(f"Health check: At least one worker is ready in full_parallel mode.")
+                else:
+                    # For default mode, all workers must be ready
+                    workers_ready = all(v == WorkerSetupStatus.READY for v in self.workers_setup_status.values())
+
+            lit_api_health_status = self.lit_api.health()
+            if workers_ready and lit_api_health_status:
+                return Response(content="ok", status_code=200)
+
+            return Response(content="not ready", status_code=503)
+
+        @self.app.get(self.info_path, dependencies=[Depends(self.setup_auth())])
+        async def info(request: Request) -> Response:
+            return JSONResponse(
+                content={
+                    "model": self.model_metadata,
+                    "server": {
+                        "devices": self.devices,
+                        "workers_per_device": self.workers_per_device,
+                        "timeout": self.timeout,
+                        "max_batch_size": self.max_batch_size,
+                        "batch_timeout": self.batch_timeout,
+                        "stream": self.stream,
+                        "max_payload_size": self.max_payload_size,
+                        "track_requests": self.track_requests,
+                    },
+                }
+            )
+
+        async def predict(request: self.request_type) -> self.response_type:
+            self._callback_runner.trigger_event(
+                EventTypes.ON_REQUEST,
+                active_requests=self.active_requests,
+                litserver=self,
+            )
+            response_queue_id = self.app.response_queue_id
+            uid = uuid.uuid4()
+            event = asyncio.Event()
+            self.response_buffer[uid] = event
+            logger.debug(f"Received request uid={uid}")
+
+            payload = request
+            if self.request_type == Request:
+                if request.headers["Content-Type"] == "application/x-www-form-urlencoded" or request.headers[
+                    "Content-Type"
+                ].startswith("multipart/form-data"):
+                    payload = await request.form()
+                else:
+                    payload = await request.json()
+
+            self.request_queue.put((response_queue_id, uid, time.monotonic(), payload))
+
+            await event.wait()
+            response, status = self.response_buffer.pop(uid)
+            if status == LitAPIStatus.ERROR and isinstance(response, HTTPException):
+                logger.error("Error in request: %s", response)
+                raise response
+            if status == LitAPIStatus.ERROR:
+                logger.error("Error in request: %s", response)
+                raise HTTPException(status_code=500)
+            self._callback_runner.trigger_event(EventTypes.ON_RESPONSE, litserver=self)
+            return response
+
+        async def stream_predict(request: self.request_type) -> self.response_type:
+            self._callback_runner.trigger_event(
+                EventTypes.ON_REQUEST,
+                active_requests=self.active_requests,
+                litserver=self,
+            )
+            response_queue_id = self.app.response_queue_id
+            uid = uuid.uuid4()
+            event = asyncio.Event()
+            q = deque()
+            self.response_buffer[uid] = (q, event)
+            logger.debug(f"Received request uid={uid}")
+
+            payload = request
+            if self.request_type == Request:
+                payload = await request.json()
+            self.request_queue.put((response_queue_id, uid, time.monotonic(), payload))
+
+            response = call_after_stream(
+                self.data_streamer(q, data_available=event),
+                self._callback_runner.trigger_event,
+                EventTypes.ON_RESPONSE,
+                litserver=self,
+            )
+            return StreamingResponse(response)
+
+        if not self._specs:
+            stream = self.lit_api.stream
+            # In the future we might want to differentiate endpoints for streaming vs non-streaming
+            # For now we allow either one or the other
+            endpoint = self.api_path
+            methods = ["POST"]
+            self.app.add_api_route(
+                endpoint,
+                stream_predict if stream else predict,
+                methods=methods,
+                dependencies=[Depends(self.setup_auth())],
+            )
+
+        for spec in self._specs:
+            spec: LitSpec
+            # TODO check that path is not clashing
+            for path, endpoint, methods in spec.endpoints:
+                self.app.add_api_route(
+                    path, endpoint=endpoint, methods=methods, dependencies=[Depends(self.setup_auth())]
+                )
+
+        for middleware in self.middlewares:
+            if isinstance(middleware, tuple):
+                middleware, kwargs = middleware
+                self.app.add_middleware(middleware, **kwargs)
+            elif callable(middleware):
+                self.app.add_middleware(middleware)
 
     def verify_worker_status(self):
         while not any(v == WorkerSetupStatus.READY for v in self.workers_setup_status.values()):
@@ -560,6 +1084,8 @@ class LitServer:
         api_server_worker_type: Optional[str] = None,
         **kwargs,
     ):
+        print(f"[{os.getpid()}] Entering LitServer.run for port {port}") # Diagnostic print
+
         if generate_client_file:
             LitServer.generate_client_file(port=port)
 
@@ -593,21 +1119,91 @@ class LitServer:
         elif api_server_worker_type is None:
             api_server_worker_type = "process"
 
-        manager, litserve_workers = self.launch_inference_worker(num_api_servers)
-
-        self.verify_worker_status()
+        manager = None
         try:
-            servers = self._start_server(port, num_api_servers, log_level, sockets, api_server_worker_type, **kwargs)
+            print(f"[{os.getpid()}] Calling launch_inference_worker...") # Diagnostic print
+            # launch_inference_worker should return the started manager and worker list
+            manager, litserve_workers = self.launch_inference_worker(num_api_servers)
+            print(f"[{os.getpid()}] launch_inference_worker completed. Manager: {id(manager)}, Workers: {len(litserve_workers)}") # Diagnostic print
+
+            # Add a longer delay *after* the manager is presumably started by launch_inference_worker
+            # This is especially important for full_parallel mode which has more workers to connect
+            print(f"[{os.getpid()}] Adding delay for manager socket initialization...")
+            delay = 3.0 if self.execution_mode == "full_parallel" else 1.0
+            print(f"[{os.getpid()}] Using {delay}s delay for {self.execution_mode} mode.")
+            time.sleep(delay)
+
+            print(f"[{os.getpid()}] Verifying worker status...") # Diagnostic print
+            self.verify_worker_status() # Now verify status after the delay
+            print(f"[{os.getpid()}] Worker status verified.") # Diagnostic print
+
+        except Exception as e:
+            print(f"!!! [{os.getpid()}] Error during launch_inference_worker or verify_worker_status: {e}") # Diagnostic print
+            # Clean up if possible
+            if manager is not None:
+                try:
+                    manager.shutdown()
+                except Exception as shutdown_e:
+                    print(f"!!! [{os.getpid()}] Error shutting down manager during exception handling: {shutdown_e}")
+            for worker in litserve_workers:
+                if worker.is_alive():
+                    worker.terminate()
+                worker.join(timeout=1)
+            raise # Re-raise the original error
+
+        try:
+            print(f"[{os.getpid()}] Starting Uvicorn server...") # Diagnostic print
+            # Start the FastAPI server using Uvicorn
+            servers = []
+            for response_queue_id in range(num_api_servers):
+                self.app.response_queue_id = response_queue_id
+                if self.lit_spec:
+                    self.lit_spec.response_queue_id = response_queue_id
+                app: FastAPI = copy.copy(self.app)
+
+                self._prepare_app_run(app)
+
+                config = uvicorn.Config(app=app, host="0.0.0.0", port=port, log_level=log_level, **kwargs)
+                server = uvicorn.Server(config=config)
+                if api_server_worker_type == "process":
+                    ctx = mp.get_context("fork")
+                    w = ctx.Process(target=server.run, args=(sockets,))
+                elif api_server_worker_type == "thread":
+                    w = threading.Thread(target=server.run, args=(sockets,))
+                else:
+                    raise ValueError("Invalid value for api_server_worker_type. Must be 'process' or 'thread'")
+                w.start()
+                servers.append(w)
             print(f"Swagger UI is available at http://0.0.0.0:{port}/docs")
             for s in servers:
                 s.join()
         finally:
-            print("Shutting down LitServe")
-            self._transport.close()
-            for w in litserve_workers:
-                w.terminate()
-                w.join()
-            manager.shutdown()
+            print(f"[{os.getpid()}] Entering finally block for shutdown...")
+            # Graceful shutdown sequence
+            # Terminate any running servers
+            for server in servers:
+                if server.is_alive():
+                    print(f"[{os.getpid()}] Shutdown: Terminating Uvicorn server...")
+                    server.terminate() if hasattr(server, 'terminate') else None
+
+            if manager is not None:
+                print(f"[{os.getpid()}] Shutdown: Shutting down multiprocessing manager...")
+                # Check if manager is running before shutting down? No easy way in public API.
+                try:
+                    # Removed redundant check, shutdown should handle if not running
+                    manager.shutdown()
+                    print(f"[{os.getpid()}] Shutdown: Manager shut down.")
+                except Exception as e:
+                    print(f"!!! [{os.getpid()}] Shutdown: Error shutting down manager: {e}")
+            else:
+                 print(f"[{os.getpid()}] Shutdown: Manager was None, skipping shutdown.")
+
+            print(f"[{os.getpid()}] Shutdown: Terminating and joining worker processes...")
+            for worker in litserve_workers:
+                if worker.is_alive():
+                    worker.terminate()
+                worker.join(timeout=1)
+            print(f"[{os.getpid()}] Shutdown complete.")
 
     def _prepare_app_run(self, app: FastAPI):
         # Add middleware to count active requests
@@ -615,32 +1211,33 @@ class LitServer:
         self.active_counters.append(active_counter)
         app.add_middleware(RequestCountMiddleware, active_counter=active_counter)
 
-    def _start_server(self, port, num_uvicorn_servers, log_level, sockets, uvicorn_worker_type, **kwargs):
-        servers = []
-        for response_queue_id in range(num_uvicorn_servers):
-            self.app.response_queue_id = response_queue_id
-            if self.lit_spec:
-                self.lit_spec.response_queue_id = response_queue_id
-            app: FastAPI = copy.copy(self.app)
-
-            self._prepare_app_run(app)
-
-            config = uvicorn.Config(app=app, host="0.0.0.0", port=port, log_level=log_level, **kwargs)
-            server = uvicorn.Server(config=config)
-            if uvicorn_worker_type == "process":
-                ctx = mp.get_context("fork")
-                w = ctx.Process(target=server.run, args=(sockets,))
-            elif uvicorn_worker_type == "thread":
-                w = threading.Thread(target=server.run, args=(sockets,))
-            else:
-                raise ValueError("Invalid value for api_server_worker_type. Must be 'process' or 'thread'")
-            w.start()
-            servers.append(w)
-        return servers
-
     def setup_auth(self):
         if hasattr(self.lit_api, "authorize") and callable(self.lit_api.authorize):
             return self.lit_api.authorize
         if LIT_SERVER_API_KEY:
             return api_key_auth
         return no_auth
+
+    @staticmethod
+    def generate_client_file(port: Union[str, int] = 8000):
+        dest_path = os.path.join(os.getcwd(), "client.py")
+
+        if os.path.exists(dest_path):
+            logger.debug("client.py already exists in the current directory. Skipping generation.")
+            return
+
+        try:
+            client_code = client_template.format(PORT=port)
+            with open(dest_path, "w") as f:
+                f.write(client_code)
+
+        except Exception as e:
+            logger.exception(f"Error copying file: {e}")
+
+    def stop(self):
+        if self._server:
+            self._server.stop()
+        # Add worker cleanup
+        for process in self.worker_processes:
+            process.terminate()
+        self.worker_processes = []

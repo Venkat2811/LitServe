@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import time
 import warnings
 from abc import ABC, abstractmethod
 from queue import Queue
-from typing import Callable, Optional
+from typing import Callable, Optional, Any, Union
 
 from pydantic import BaseModel
 
@@ -29,11 +30,49 @@ class LitAPI(ABC):
     _device: Optional[str] = None
     _logger_queue: Optional[Queue] = None
     request_timeout: Optional[float] = None
+    callbacks: list
+
+    def __init__(self):
+        self.cold_start_proxy_calls = 0
+        self.last_call_time = time.time()
+        self.callbacks = []
 
     @abstractmethod
-    def setup(self, device):
-        """Setup the model so it can be called in `predict`."""
+    def setup(self, device: str) -> None:
+        """Setup the model environment. 
+        
+        Called once per worker process/thread when the worker starts.
+        """
         pass
+
+    def preprocess_setup(self, device: str) -> None:
+        """Setup the environment for preprocessing.
+
+        Called once per preprocessing worker process/thread when the worker starts.
+        This is useful for initializing resources like tokenizers or other
+        preprocessing components without loading the main model in preprocessing workers,
+        especially when using the "full_parallel" execution mode.
+
+        Args:
+            device: The device assigned to this worker (typically "cpu" for preprocessing).
+        """
+        pass
+
+    def preprocess(self, x: Any, **kwargs) -> Any:
+        """Preprocess the input data before passing it to the model for inference.
+        
+        This method is called in the preprocessing stage when using the "full_parallel" execution mode.
+        By default, it simply returns the input unchanged. Override this method to implement
+        custom preprocessing logic such as tokenization, feature extraction, etc.
+        
+        Args:
+            x: The decoded input data to preprocess.
+            **kwargs: Additional keyword arguments.
+            
+        Returns:
+            The preprocessed data ready for the predict method.
+        """
+        return x
 
     def decode_request(self, request, **kwargs):
         """Convert the request payload to your model input."""

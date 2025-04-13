@@ -14,7 +14,7 @@
 from litserve import test_examples
 from litserve.__about__ import *  # noqa: F403
 from litserve.api import LitAPI
-from litserve.callbacks import Callback
+from litserve.callbacks import Callback, CallbackRunner
 from litserve.loggers import Logger
 from litserve.server import LitServer, Request, Response
 from litserve.specs import OpenAIEmbeddingSpec, OpenAISpec
@@ -31,5 +31,6 @@ __all__ = [
     "OpenAIEmbeddingSpec",
     "test_examples",
     "Callback",
+    "CallbackRunner",
     "Logger",
 ]

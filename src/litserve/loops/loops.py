@@ -13,10 +13,10 @@
 # limitations under the License.
 import logging
 from queue import Queue
-from typing import Dict, Optional, Union
+from typing import Dict, List, Optional, Union
 
 from litserve import LitAPI
-from litserve.callbacks import CallbackRunner, EventTypes
+from litserve.callbacks import Callback, EventTypes, CallbackRunner
 from litserve.loops.base import _BaseLoop
 from litserve.loops.simple_loops import BatchedLoop, SingleLoop
 from litserve.loops.streaming_loops import BatchedStreamingLoop, StreamingLoop
@@ -36,6 +36,78 @@ def get_default_loop(stream: bool, max_batch_size: int) -> _BaseLoop:
     if max_batch_size > 1:
         return BatchedLoop()
     return SingleLoop()
+
+
+def simple_unified_loop(
+    lit_api: LitAPI,
+    lit_spec: Optional[LitSpec],
+    device: str,
+    worker_id: int,
+    request_queue: Queue,
+    transport: MessageTransport,
+    max_batch_size: int,
+    batch_timeout: float,
+    stream: bool,
+    workers_setup_status: Dict[int, str],
+    has_preprocess: bool,
+):
+    """Unified worker loop for the 'default' execution mode.
+    
+    In this mode, all stages (decode_request, preprocess, predict, encode_response)
+    run sequentially in the same worker loop.
+    
+    Args:
+        lit_api: The API instance that handles requests and responses.
+        lit_spec: Optional specification for the API.
+        device: The device to use for inference.
+        worker_id: Unique identifier for this worker.
+        request_queue: Queue for receiving requests.
+        transport: Transport for sending responses.
+        max_batch_size: Maximum number of requests to process in a batch.
+        batch_timeout: Maximum time to wait for a batch to fill.
+        stream: Whether to enable streaming responses.
+        workers_setup_status: Dictionary to track worker setup status.
+        has_preprocess: Whether the lit_api has a custom preprocess implementation.
+    """
+    # Setup the worker
+    try:
+        lit_api.setup(device)
+    except Exception:
+        logger.exception(f"Error setting up worker {worker_id}.")
+        workers_setup_status[worker_id] = WorkerSetupStatus.ERROR
+        return
+    
+    lit_api.device = device
+    print(f"Setup complete for worker {worker_id}.")
+    
+    if workers_setup_status:
+        workers_setup_status[worker_id] = WorkerSetupStatus.READY
+    
+    if lit_spec:
+        logging.info(f"LitServe will use {lit_spec.__class__.__name__} spec")
+    
+    # Determine the appropriate loop based on streaming and batch size
+    loop = get_default_loop(stream, max_batch_size)
+    
+    # Create a callback runner with the API's callbacks
+    # Make sure to print the callback for debugging
+    print(f"Worker {worker_id} callbacks: {lit_api.callbacks}")
+    callback_runner = CallbackRunner(lit_api.callbacks or [])
+    
+    # Run the loop
+    loop(
+        lit_api,
+        lit_spec,
+        device,
+        worker_id,
+        request_queue,
+        transport,
+        max_batch_size,
+        batch_timeout,
+        stream,
+        workers_setup_status,
+        callback_runner,  # Pass a proper callback_runner
+    )
 
 
 def inference_worker(
