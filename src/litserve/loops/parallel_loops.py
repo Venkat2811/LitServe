@@ -13,15 +13,17 @@
 # limitations under the License.
 
 import logging
-from typing import Any, Dict, Optional
 import queue
-import random
 import time
+import multiprocessing as mp
+import random
+from typing import Any, Dict, Type, Optional
 from multiprocessing.managers import RemoteError
+from multiprocessing.synchronize import Event
 
 from litserve.api import LitAPI
 from litserve.specs.base import LitSpec
-from litserve.utils import _is_torch_available, WorkerSetupStatus # Corrected imports
+from litserve.utils import _is_torch_available, WorkerSetupStatus
 
 if _is_torch_available():
     import torch
@@ -30,15 +32,17 @@ logger = logging.getLogger(__name__)
 
 
 def decode_loop(
-    lit_api: LitAPI,
+    api_cls: Type[LitAPI],
     lit_spec: Optional[LitSpec],
     input_queue: Any,  # Transport Queue (e.g., mp.Queue)
     output_queue: Any, # Transport Queue
     worker_id: int,
-    setup_status: Dict, # e.g., mp.Manager().dict()
+    ready_queue: Any,
     callback_runner=None
 ):
     """Worker loop dedicated to decoding requests."""
+    # Instantiate the API object
+    lit_api = api_cls() # Instantiate API
     logger.info(f"Decode worker {worker_id} starting.")
     # Initial setup and connection retry
     setup_attempts = 5
@@ -47,9 +51,10 @@ def decode_loop(
         try:
             # Perform minimal setup if needed, maybe device placement? For now, assume CPU
             # lit_api.setup("cpu") # Or a separate setup? Let's rely on predict_loop setup for now.
-            if setup_status:
-                setup_status[worker_id] = WorkerSetupStatus.READY
-            logger.info(f"Decode worker {worker_id} ready (attempt {attempt + 1}).")
+            logger.info(f"Decode worker {worker_id}: Initializing API...")
+            lit_api.setup(device="cpu")  # Decode always runs on CPU
+            logger.info(f"Decode worker {worker_id}: API setup complete.")
+            ready_queue.put(worker_id) # Signal readiness via ready_queue
             setup_success = True
             break
         except (FileNotFoundError, AttributeError) as e: # Catch specific connection errors
@@ -58,15 +63,23 @@ def decode_loop(
             logger.warning(f"Decode worker {worker_id} connection failed (attempt {attempt + 1}/{setup_attempts}): {e}. Retrying...")
             time.sleep(0.2 * (attempt + 1)) # Exponential backoff
         except Exception as e:
-            logger.exception(f"Decode worker {worker_id} encountered unexpected error during setup: {e}")
-            if setup_status:
-                setup_status[worker_id] = WorkerSetupStatus.ERROR
+            logger.error(f"Decode worker {worker_id}: Error during setup: {e}", exc_info=True)
+            # Try to signal readiness even on error, but might fail if ready_queue connection is lost
+            try:
+                ready_queue.put(worker_id)
+            except Exception as signal_e:
+                logger.error(f"Decode worker {worker_id}: Failed to signal readiness after setup error: {signal_e}")
+            if callback_runner:
+                callback_runner.trigger_event(EventTypes.ON_WORKER_ERROR, worker_id=worker_id, worker_type="decode", error=e)
             return # Exit if setup fails due to other reasons
 
     if not setup_success:
         logger.error(f"Decode worker {worker_id} failed to connect after {setup_attempts} attempts.")
-        if setup_status:
-            setup_status[worker_id] = WorkerSetupStatus.ERROR
+        # Try to signal readiness even on error, but might fail if ready_queue connection is lost
+        try:
+            ready_queue.put(worker_id)
+        except Exception as signal_e:
+            logger.error(f"Decode worker {worker_id}: Failed to signal readiness after setup error: {signal_e}")
         return
 
     while True:
@@ -96,42 +109,41 @@ def decode_loop(
             # Normal timeout, continue loop
             continue
         except (RemoteError, EOFError, BrokenPipeError) as e:
-            logger.warning(f"Decode worker {worker_id} lost connection to manager: {e}. Exiting loop.")
-            break # Exit loop if manager connection is lost
+            logger.warning(f"Decode worker {worker_id} lost connection to ready_queue: {e}. Exiting loop.")
+            break # Exit loop if ready_queue connection is lost
         except (KeyboardInterrupt, SystemExit):
             logger.info(f"Decode worker {worker_id} received exit signal.")
             break
         except Exception as e:
             # Catch unexpected errors in the loop itself
             logger.exception(f"Decode worker {worker_id} encountered unexpected error: {e}")
-            if setup_status:
-                setup_status[worker_id] = WorkerSetupStatus.ERROR # Corrected status
-            # Consider breaking or specific recovery logic
             time.sleep(1) # Avoid tight loop on persistent error
 
     logger.info(f"Decode worker {worker_id} stopped.")
 
 
 def preprocess_loop(
-    lit_api: LitAPI,
+    api_cls: Type[LitAPI],
     lit_spec: Optional[LitSpec],
     input_queue: Any,  # Transport Queue (decoded_queue)
     output_queue: Any, # Transport Queue (preprocess_queue)
     worker_id: int,
-    setup_status: Dict,
+    ready_queue: Any,
     callback_runner=None,
 ):
     """Worker loop dedicated to preprocessing data."""
+    # Instantiate the API object
+    lit_api = api_cls()
     logger.info(f"Preprocess worker {worker_id} starting.")
     # Initial setup and connection retry
     setup_attempts = 5
     setup_success = False
     for attempt in range(setup_attempts):
         try:
-            lit_api.preprocess_setup("cpu") # Assuming preprocess runs on CPU
-            if setup_status:
-                setup_status[worker_id] = WorkerSetupStatus.READY
-            logger.info(f"Preprocess worker {worker_id} ready (attempt {attempt + 1}).")
+            logger.info(f"Preprocess worker {worker_id}: Initializing API...")
+            lit_api.setup(device="cpu")
+            logger.info(f"Preprocess worker {worker_id}: API setup complete.")
+            ready_queue.put(worker_id) # Signal readiness via ready_queue
             setup_success = True
             break
         except (FileNotFoundError, AttributeError) as e:
@@ -140,15 +152,23 @@ def preprocess_loop(
             logger.warning(f"Preprocess worker {worker_id} connection failed (attempt {attempt + 1}/{setup_attempts}): {e}. Retrying...")
             time.sleep(0.2 * (attempt + 1))
         except Exception as e:
-            logger.exception(f"Preprocess worker {worker_id} encountered unexpected error during setup: {e}")
-            if setup_status:
-                setup_status[worker_id] = WorkerSetupStatus.ERROR
+            logger.error(f"Preprocess worker {worker_id}: Error during setup: {e}", exc_info=True)
+            # Try to signal readiness even on error, but might fail if ready_queue connection is lost
+            try:
+                ready_queue.put(worker_id)
+            except Exception as signal_e:
+                logger.error(f"Preprocess worker {worker_id}: Failed to signal readiness after setup error: {signal_e}")
+            if callback_runner:
+                callback_runner.trigger_event(EventTypes.ON_WORKER_ERROR, worker_id=worker_id, worker_type="preprocess", error=e)
             return
 
     if not setup_success:
         logger.error(f"Preprocess worker {worker_id} failed to connect after {setup_attempts} attempts.")
-        if setup_status:
-            setup_status[worker_id] = WorkerSetupStatus.ERROR
+        # Try to signal readiness even on error, but might fail if ready_queue connection is lost
+        try:
+            ready_queue.put(worker_id)
+        except Exception as signal_e:
+            logger.error(f"Preprocess worker {worker_id}: Failed to signal readiness after setup error: {signal_e}")
         return
 
     while True:
@@ -176,15 +196,13 @@ def preprocess_loop(
         except queue.Empty:
             continue
         except (RemoteError, EOFError, BrokenPipeError) as e:
-            logger.warning(f"Preprocess worker {worker_id} lost connection to manager: {e}. Exiting loop.")
-            break # Exit loop if manager connection is lost
+            logger.warning(f"Preprocess worker {worker_id} lost connection to ready_queue: {e}. Exiting loop.")
+            break # Exit loop if ready_queue connection is lost
         except (KeyboardInterrupt, SystemExit):
             logger.info(f"Preprocess worker {worker_id} received exit signal.")
             break
         except Exception as e:
             logger.exception(f"Preprocess worker {worker_id} encountered unexpected error: {e}")
-            if setup_status:
-                setup_status[worker_id] = WorkerSetupStatus.ERROR # Corrected status
             time.sleep(1)
 
     logger.info(f"Preprocess worker {worker_id} stopped.")
@@ -282,7 +300,7 @@ def _process_predict_batch(
 
 
 def predict_loop(
-    lit_api: LitAPI,
+    api_cls: Type[LitAPI],
     lit_spec: Optional[LitSpec],
     device: str,
     input_queue: Any,  # Transport Queue (predict_input_queue)
@@ -290,10 +308,11 @@ def predict_loop(
     worker_id: int,
     max_batch_size: int,
     batch_timeout: float,
-    setup_status: Dict,
+    ready_queue: Any,
     callback_runner=None,
 ):
     """Worker loop dedicated to model prediction/inference with batching."""
+    lit_api = api_cls() # Instantiate API
     logger.info(f"Predict worker {worker_id} starting on device {device}.")
     # Initial setup and connection retry
     setup_attempts = 5
@@ -302,13 +321,25 @@ def predict_loop(
     setup_success = False
     for attempt in range(setup_attempts):
         try:
-            # Ensure the queue proxy is ready
-            # Simple check to see if connection works
-            _ = input_queue.qsize()
-            # Don't set READY status until API setup is also done
-            logger.info(f"Predict worker {worker_id} connection check successful (attempt {attempt + 1}).")
+            # Call the main setup for predict workers
+            logger.info(f"Predict worker {worker_id} on device {device}: Initializing API...")
+            lit_api.setup(device=device)
+            if lit_spec:
+                lit_spec.setup(lit_api) # Allow spec to modify/setup API
+
+            # Check if input queue is accessible (removed potentially problematic qsize)
+            # If direct access fails early, it indicates a ready_queue issue.
+            # A simple poll might be less problematic than qsize
+            try:
+                input_queue.empty() # Use empty() as a less problematic check
+            except Exception as q_err:
+                logger.warning(f"Predict worker {worker_id} setup: Input queue check failed: {q_err}")
+                # Depending on the error, might indicate a deeper ready_queue issue
+
+            logger.info(f"Predict worker {worker_id} on device {device}: API setup complete.")
+            ready_queue.put(worker_id) # Signal readiness via ready_queue
             setup_success = True
-            break
+            break # Exit retry loop on success
         except (FileNotFoundError, AttributeError, ConnectionRefusedError, BrokenPipeError) as e:
             if "'ForkAwareLocal' object has no attribute 'connection'" not in str(e) and not isinstance(e, FileNotFoundError):
                 raise # Re-raise if it's not the expected connection error
@@ -317,13 +348,19 @@ def predict_loop(
                 time.sleep(0.2 * (attempt + 1)) # Exponential backoff
             else:
                 logger.error(f"Predict worker {worker_id} failed to connect after {setup_attempts} attempts.")
-                if setup_status:
-                    setup_status[worker_id] = WorkerSetupStatus.ERROR
+                # Signal readiness (or failure) outside the main try/except to ensure it happens
+                try:
+                    ready_queue.put(worker_id)
+                except Exception as signal_e:
+                    logger.error(f"Predict worker {worker_id}: Failed to signal readiness after setup attempt: {signal_e}")
                 return # Exit if connection setup fails completely
         except Exception as e:
             logger.exception(f"Predict worker {worker_id} encountered unexpected error during setup: {e}")
-            if setup_status:
-                setup_status[worker_id] = WorkerSetupStatus.ERROR
+            # Signal readiness (or failure) outside the main try/except to ensure it happens
+            try:
+                ready_queue.put(worker_id)
+            except Exception as signal_e:
+                logger.error(f"Predict worker {worker_id}: Failed to signal readiness after setup attempt: {signal_e}")
             return # Exit if setup fails due to other reasons
 
     if not setup_success:
@@ -333,13 +370,11 @@ def predict_loop(
 
     try: # Main try for API setup and processing loop
         # 2. API Setup (inside main try)
-        lit_api.setup(device)
         if _is_torch_available():
             import torch
             torch.cuda.empty_cache()
         logger.info(f"Predict worker {worker_id} completed LitAPI setup on {device}.")
-        if setup_status: # Set final ready status only after successful setup
-            setup_status[worker_id] = WorkerSetupStatus.READY
+        # ready_event.set() # Moved to setup completion
 
         # 3. Main Loop (inside main try)
         exit_loop = False
@@ -363,7 +398,7 @@ def predict_loop(
                     # Timeout occurred, break collection loop
                     break
                 except (RemoteError, EOFError, BrokenPipeError) as e:
-                    logger.warning(f"Predict worker {worker_id} lost connection to manager during batch collection: {e}. Exiting loop.")
+                    logger.warning(f"Predict worker {worker_id} lost connection to ready_queue during batch collection: {e}. Exiting loop.")
                     exit_loop = True # Set flag to exit outer loop
                     break # Break collection loop
                 except Exception as e:
@@ -381,7 +416,7 @@ def predict_loop(
                     # Perform prediction
                     _process_predict_batch(batch, inputs, lit_api, worker_id, output_queue, max_batch_size, lit_api.requires_batch, lit_api.requires_unbatch, callback_runner)
                 except (RemoteError, EOFError, BrokenPipeError) as e:
-                     logger.warning(f"Predict worker {worker_id} lost connection to manager during batch processing: {e}. Exiting loop.")
+                     logger.warning(f"Predict worker {worker_id} lost connection to ready_queue during batch processing: {e}. Exiting loop.")
                      exit_loop = True # Set flag to exit outer loop
                      # No break needed here, flag checked at start/end of outer loop
                 except Exception as e:
@@ -396,26 +431,35 @@ def predict_loop(
     # Catches errors from API Setup or the main loop
     except (RemoteError, EOFError, BrokenPipeError) as e:
          logger.warning(f"Predict worker {worker_id} connection error during operation: {e}. Exiting.")
-         if setup_status: # Mark as error if it happens after setup
-             setup_status[worker_id] = WorkerSetupStatus.ERROR
+         # Signal readiness (or failure) outside the main try/except to ensure it happens
+         try:
+             ready_queue.put(worker_id)
+         except Exception as signal_e:
+             logger.error(f"Predict worker {worker_id}: Failed to signal readiness after setup attempt: {signal_e}")
     except Exception as e:
         # Log errors during setup or catastrophic failures
         logger.error(f"Predict worker {worker_id} failed during setup or loop: {e}", exc_info=True)
-        if setup_status:
-             setup_status[worker_id] = WorkerSetupStatus.ERROR
+        # Signal readiness (or failure) outside the main try/except to ensure it happens
+        try:
+            ready_queue.put(worker_id)
+        except Exception as signal_e:
+            logger.error(f"Predict worker {worker_id}: Failed to signal readiness after setup attempt: {signal_e}")
     finally:
         logger.info(f"Predict worker {worker_id} exiting.")
 
+
 def encode_loop(
-    lit_api: LitAPI,
+    api_cls: Type[LitAPI],
     lit_spec: Optional[LitSpec],
-    input_queue: Any,    # Transport Queue (predict_output_queue)
-    response_transport: Any, # Main response transport object
+    response_input_queue: Any,    # Transport Queue (predict_output_queue)
+    result_queue: Any, # Main response transport object
     worker_id: int,
-    setup_status: Dict,
+    ready_queue: Any,
     callback_runner=None,
 ):
-    """Worker loop dedicated to encoding responses."""
+    """Worker loop that encodes model predictions before sending back to the client."""
+    # Instantiate the API object
+    lit_api = api_cls() # Instantiate API
     logger.info(f"Encode worker {worker_id} starting.")
     # Initial setup and connection retry
     setup_attempts = 5
@@ -423,9 +467,10 @@ def encode_loop(
     for attempt in range(setup_attempts):
         try:
             # Minimal setup, if any, needed for encoding? Assume none for now.
-            if setup_status:
-                setup_status[worker_id] = WorkerSetupStatus.READY
-            logger.info(f"Encode worker {worker_id} ready (attempt {attempt + 1}).")
+            logger.info(f"Encode worker {worker_id}: Initializing API...")
+            lit_api.setup(device="cpu")  # Encode always runs on CPU
+            logger.info(f"Encode worker {worker_id}: API setup complete.")
+            ready_queue.put(worker_id) # Signal readiness via ready_queue
             setup_success = True
             break
         except (FileNotFoundError, AttributeError) as e:
@@ -434,22 +479,32 @@ def encode_loop(
             logger.warning(f"Encode worker {worker_id} connection failed (attempt {attempt + 1}/{setup_attempts}): {e}. Retrying...")
             time.sleep(0.2 * (attempt + 1))
         except Exception as e:
-            logger.exception(f"Encode worker {worker_id} encountered unexpected error during setup: {e}")
-            if setup_status:
-                setup_status[worker_id] = WorkerSetupStatus.ERROR
+            logger.error(f"Encode worker {worker_id}: Error during setup: {e}", exc_info=True)
+            # Try to signal readiness even on error, but might fail if ready_queue connection is lost
+            try:
+                ready_queue.put(worker_id)
+            except Exception as signal_e:
+                logger.error(f"Encode worker {worker_id}: Failed to signal readiness after setup error: {signal_e}")
+            if callback_runner:
+                callback_runner.trigger_event(EventTypes.ON_WORKER_ERROR, worker_id=worker_id, worker_type="encode", error=e)
             return
 
     if not setup_success:
         logger.error(f"Encode worker {worker_id} failed to connect after {setup_attempts} attempts.")
-        if setup_status:
-             setup_status[worker_id] = WorkerSetupStatus.ERROR
+        # Try to signal readiness even on error, but might fail if ready_queue connection is lost
+        try:
+            ready_queue.put(worker_id)
+        except Exception as signal_e:
+            logger.error(f"Encode worker {worker_id}: Failed to signal readiness after setup error: {signal_e}")
         return
 
+    logger.info(f"Encode worker {worker_id} entering main loop.")
     while True:
         try:
             # Get prediction result tuple: (response_queue_id, uid, timestamp, result)
             # Result could be the actual prediction or an Exception from predict_loop
-            response_queue_id, uid, timestamp, result = input_queue.get(timeout=1.0)
+            logger.debug(f"Encode worker {worker_id}: Attempting get() from queue proxy: {response_input_queue}") # Added log
+            response_queue_id, uid, timestamp, result = response_input_queue.get(timeout=1.0)
 
             try:
                 # Check if the result from predict_loop was an error
@@ -464,33 +519,29 @@ def encode_loop(
                     encoded_response = lit_api.encode_response(result)
                 
                 # Send final tuple: (response_queue_id, uid, timestamp, encoded_response)
-                response_transport.put((response_queue_id, uid, timestamp, encoded_response))
+                result_queue.put((response_queue_id, uid, timestamp, encoded_response))
 
             except Exception as e:
                 logger.error(f"Encode worker {worker_id} failed processing request {uid}: {e}", exc_info=True)
                 # Try sending an error back if encoding failed
                 try:
                     error_payload = f"Encoding failed: {e}" # Simple error message
-                    response_transport.put((response_queue_id, uid, timestamp, error_payload))
+                    result_queue.put((response_queue_id, uid, timestamp, error_payload))
                 except Exception as send_e:
                     logger.error(f"Encode worker {worker_id} failed to send error for {uid}: {send_e}")
 
         except queue.Empty:
+            # Normal timeout, continue loop
             continue
-        except KeyError as e:
-             # This might happen if response_queue_id is invalid, possibly due to manager shutdown
-             logger.warning(f"Encode worker {worker_id} encountered KeyError accessing response queue '{e}'. Manager might be shutting down. Exiting loop.")
-             break
-        except (RemoteError, EOFError, BrokenPipeError) as e:
-            logger.warning(f"Encode worker {worker_id} lost connection to manager: {e}. Exiting loop.")
-            break # Exit loop if manager connection is lost
-        except (KeyboardInterrupt, SystemExit):
-            logger.info(f"Encode worker {worker_id} received exit signal.")
+        except (BrokenPipeError, EOFError, ConnectionResetError, OSError) as e:
+            # Specific ready_queue connection errors
+            logger.warning(f"Encode worker {worker_id} lost connection to ready_queue: {e}. Exiting loop.")
             break
         except Exception as e:
-            logger.exception(f"Encode worker {worker_id} encountered unexpected error: {e}")
-            if setup_status:
-                setup_status[worker_id] = WorkerSetupStatus.ERROR # Corrected status
-            time.sleep(1)
+            # General errors during the loop
+            logger.exception(f"Encode worker {worker_id} encountered error in main loop: {e}")
+            # We might want to break here depending on the error, or try to continue
+            # For now, let's break on general exceptions too, as they might indicate state corruption
+            break
 
     logger.info(f"Encode worker {worker_id} stopped.")
